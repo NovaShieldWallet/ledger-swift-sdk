@@ -1,13 +1,13 @@
-// swift-tools-version: 5.6
+// swift-tools-version: 6.0
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
 
 let package = Package(
-    name: "BleTransport",
+    name: "LedgerBleTransport",
     platforms: [
-        .iOS(.v13),
-        .macOS(.v12)
+        .iOS(.v17),
+        .macOS(.v14)
     ],
     products: [
         .library(
@@ -16,7 +16,11 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "BleTransport"),
+            name: "BleTransport",
+            swiftSettings: [
+                .swiftLanguageMode(.v5)
+            ]
+        ),
         .testTarget(
             name: "BleTransportTests",
             dependencies: ["BleTransport"]),
