@@ -179,7 +179,7 @@ extension BleTransport: BleModuleDelegate {
     ///   - retryWithResponse: Used internally in the function if `writeWithoutResponse` fails the first time
     ///   - success: The success callback
     ///   - failure: The failue callback
-    fileprivate func send<S: Sendable>(value: S, retryWithResponse: Bool = false, success: @escaping EmptyResponse, failure: @escaping BleErrorResponse) {
+    fileprivate func send<S: BluetoothSendable>(value: S, retryWithResponse: Bool = false, success: @escaping EmptyResponse, failure: @escaping BleErrorResponse) {
         let connectedPeripheral: PeripheralIdentifier
         let connectedPeripheralTuple: PeripheralInfo
         let peripheralService: BleService

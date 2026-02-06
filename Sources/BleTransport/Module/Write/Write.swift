@@ -8,7 +8,7 @@
 import Foundation
 import CoreBluetooth
 
-class Write<T: Sendable>: TaskOperation {
+class Write<T: BluetoothSendable>: TaskOperation {
     
     var finished: EmptyResponse?
     

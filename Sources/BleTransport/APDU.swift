@@ -7,7 +7,7 @@
 
 import Foundation
 
-public class APDU: Sendable, Receivable {
+public class APDU: BluetoothSendable, Receivable {
     
     public let data: Data                   /// The APDU data to send or receive.
     public var chunks: [Data] = []          /// The APDU data split into frames smaller than `mtuSize`

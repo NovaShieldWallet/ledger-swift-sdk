@@ -124,7 +124,7 @@ extension BleModule {
 
 // MARK: - Write
 extension BleModule {
-    public func write<S: Sendable>(
+    public func write<S: BluetoothSendable>(
         to characteristicIdentifier: CharacteristicIdentifier,
         value: S,
         type: CBCharacteristicWriteType = .withResponse,
