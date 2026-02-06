@@ -32,4 +32,8 @@ extension PeripheralIdentifier: Hashable {
     public static func == (lhs: PeripheralIdentifier, rhs: PeripheralIdentifier) -> Bool {
         return lhs.uuid == rhs.uuid
     }
+    
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(uuid)
+    }
 }
