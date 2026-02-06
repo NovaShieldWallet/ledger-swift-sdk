@@ -7,7 +7,7 @@
 
 import Foundation
 import CoreBluetooth
-
+import os.log
 
 extension BleTransport: BleModuleDelegate {
     func disconnected(from peripheral: PeripheralIdentifier) {
@@ -26,29 +26,60 @@ extension BleTransport: BleModuleDelegate {
     }
 }
 
-@objc public class BleTransport: NSObject, BleTransportProtocol {
+/// The main BLE transport class for communicating with Ledger hardware wallets.
+///
+/// `BleTransport` manages the full lifecycle of BLE communication including
+/// device scanning, connection, APDU exchange, and disconnection.
+///
+/// ## Usage
+///
+/// Access the shared instance via `BleTransport.shared`:
+///
+/// ```swift
+/// // Async scanning
+/// for try await devices in BleTransport.shared.scan(duration: 10) {
+///     print("Found: \(devices)")
+/// }
+///
+/// // Quick connect to first device
+/// let device = try await BleTransport.shared.create(
+///     scanDuration: 10,
+///     disconnectedCallback: nil
+/// )
+///
+/// // Exchange APDU
+/// let response = try await BleTransport.shared.exchange(
+///     apdu: APDU(data: [0xb0, 0x01, 0x00, 0x00])
+/// )
+/// ```
+public class BleTransport: NSObject, BleTransportProtocol {
     
-    typealias ConnectFunction = (PeripheralIdentifier) -> ()
+    typealias ConnectFunction = (PeripheralIdentifier) -> Void
     
-    public static var shared: BleTransportProtocol = BleTransport(configuration: nil, debugMode: false)
+    /// The shared singleton instance of BleTransport.
+    ///
+    /// Uses the default configuration which supports Nano X, Nano FTS,
+    /// Ledger Stax, and Ledger Flex devices.
+    public static var shared: BleTransportProtocol = BleTransport(configuration: nil)
     
     private let bleModule: BleModule
-    
-    private let debugMode: Bool
-    
     private let configuration: BleTransportConfiguration
-    private var disconnectedCallback: EmptyResponse? /// Once `disconnectCallback` is set it never becomes `nil` again so we can reuse it in methods where we reconnect to the peripheral blindly like `openApp/closeApp`
-    private var connectFailure: ((BleTransportError)->())?
     
-    private var scanDuration: TimeInterval = 5.0 /// `scanDuration` will be overriden every time a value gets passed to `scan/create`
+    /// Persistent disconnect callback reused across reconnections (e.g., openApp/closeApp).
+    private var disconnectedCallback: EmptyResponse?
+    private var connectFailure: ((BleTransportError) -> Void)?
+    
+    /// Scan duration, overridden by each scan/create call.
+    private var scanDuration: TimeInterval = 5.0
     
     private var peripheralsServicesTuple = [PeripheralInfo]()
     private var connectedPeripheral: PeripheralIdentifier?
-    private var bluetoothAvailabilityCompletion: ((Bool)->())?
-    private var bluetoothStateCompletion: ((CBManagerState)->())?
+    private var bluetoothAvailabilityCompletion: ((Bool) -> Void)?
+    private var bluetoothStateCompletion: ((CBManagerState) -> Void)?
     private var notifyDisconnectedCompletion: EmptyResponse?
     
-    /// Exchange handling
+    // MARK: - Exchange State
+    
     private var exchangeCallback: ((Result<String, BleTransportError>) -> Void)?
     private var isExchanging = false {
         didSet {
@@ -61,28 +92,27 @@ extension BleTransport: BleModuleDelegate {
     private var currentResponseRemainingLength = 0
     private var waitingToDisconnectCompletion: OptionalBleErrorResponse?
     
-    /// Infer MTU
+    /// MTU negotiation callback.
     private var mtuWaitingForCallback: PeripheralResponse?
     
-    @objc
+    /// Whether Bluetooth is currently powered on and available.
     public var isBluetoothAvailable: Bool {
         bleModule.isBluetoothAvailable
     }
     
-    @objc
+    /// Whether a Ledger device is currently connected.
     public var isConnected: Bool {
         connectedPeripheral != nil
     }
     
     // MARK: - Initialization
     
-    private init(configuration: BleTransportConfiguration?, debugMode: Bool) {
+    private init(configuration: BleTransportConfiguration?) {
         self.bleModule = BleModule()
         self.configuration = configuration ?? BleTransportConfiguration.defaultConfig()
-        self.debugMode = debugMode
         
         super.init()
-
+        
         self.bleModule.start(delegate: self)
     }
     
@@ -119,7 +149,6 @@ extension BleTransport: BleModuleDelegate {
         }
     }
     
-    @objc
     public func stopScanning() {
         DispatchQueue.main.async {
             self.bleModule.stopScanning()
@@ -606,9 +635,9 @@ extension BleTransport: BleModuleDelegate {
             return
         }
         
-        BleTransport.shared.exchange(apdu: apdu) { [weak self] result in
-            guard let self = self else { failure(BleTransportError.lowerLevelError(description: "closeApp -> self is nil")); return }
-            guard let disconnectedCallback = self.disconnectedCallback else { failure(BleTransportError.lowerLevelError(description: "closeApp -> disconnectedCallback is nil")); return }
+        self.exchange(apdu: apdu) { [weak self] result in
+            guard let self = self else { failure(BleTransportError.lowerLevelError(description: "openApp -> self is nil")); return }
+            guard let disconnectedCallback = self.disconnectedCallback else { failure(BleTransportError.lowerLevelError(description: "openApp -> disconnectedCallback is nil")); return }
             
             switch result {
             case .success(let response):
@@ -629,7 +658,7 @@ extension BleTransport: BleModuleDelegate {
         }
     }
     
-    /// Never call this method directly since some apps (like Bitcoin) will hang the execution if `getAppAndVersion` is not called right before
+    /// Never call this method directly since some apps (like Bitcoin) will hang the execution if `getAppAndVersion` is not called right before.
     fileprivate func closeApp(success: @escaping EmptyResponse, failure: @escaping ErrorResponse) {
         let apdu = APDU(data: [0xb0, 0xa7, 0x00, 0x00])
         
@@ -642,7 +671,7 @@ extension BleTransport: BleModuleDelegate {
             return
         }
         
-        BleTransport.shared.exchange(apdu: apdu) { [weak self] result in
+        self.exchange(apdu: apdu) { [weak self] result in
             guard let self = self else { failure(BleTransportError.lowerLevelError(description: "closeApp -> self is nil")); return }
             guard let disconnectedCallback = self.disconnectedCallback else { failure(BleTransportError.lowerLevelError(description: "closeApp -> disconnectedCallback is nil")); return }
             
@@ -896,7 +925,7 @@ extension BleTransport {
     }
 }
 
-import os.log
+// MARK: - Logging
 
 /// Internal logger for BleTransport. Uses Apple's unified logging system
 /// instead of print statements, ensuring APDU data is never leaked in
