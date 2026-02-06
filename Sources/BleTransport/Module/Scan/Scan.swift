@@ -159,13 +159,15 @@ public class Scan: TaskOperation {
         var timer: Timer?
         
         timer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: false) { [weak self] _ in
-            guard let weakSelf = self else {
+            guard let self = self else {
                 return
             }
-            weakSelf.refresh(identifier: identifier)
+            self.refresh(identifier: identifier)
         }
         
-        timers.append((identifier, timer!))
+        if let timer = timer {
+            timers.append((identifier, timer))
+        }
     }
     
     private func refresh(identifier: UUID) {

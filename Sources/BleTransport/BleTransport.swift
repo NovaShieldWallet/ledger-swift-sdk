@@ -160,7 +160,7 @@ extension BleTransport: BleModuleDelegate {
                 return
             }
             
-            print("Sending", "->", apduToSend.data.hexEncodedString())
+            bleLogger.debug("Sending APDU (\(apduToSend.data.count) bytes)")
             self.exchangeCallback = callback
             self.isExchanging = true
             self.writeAPDU(apduToSend)
@@ -296,24 +296,57 @@ extension BleTransport: BleModuleDelegate {
         exchange(apdu: apdu) { result in
             switch result {
             case .success(let string):
-                let data = string.UInt8Array()
-                var i = 0
-                let format = data[i]
-                if format != 1 {
-                    failure(BleTransportError.lowerLevelError(description: "Format is not supported"))
+                let data = string.hexToUInt8Array()
+                
+                // Validate minimum response length: format(1) + nameLen(1) + name(1+) + versionLen(1) + version(1+) = 5 bytes minimum
+                guard data.count >= 5 else {
+                    failure(BleTransportError.lowerLevelError(description: "Response too short to parse"))
                     return
                 }
+                
+                var i = 0
+                let format = data[i]
+                guard format == 1 else {
+                    failure(BleTransportError.lowerLevelError(description: "Format \(format) is not supported"))
+                    return
+                }
+                
                 i += 1
+                guard i < data.count else {
+                    failure(BleTransportError.lowerLevelError(description: "Unexpected end of response data"))
+                    return
+                }
                 let nameLength = Int(data[i])
                 i += 1
-                let nameData = data[i..<i+Int(nameLength)]
+                
+                guard i + nameLength <= data.count else {
+                    failure(BleTransportError.lowerLevelError(description: "Name length \(nameLength) exceeds available data"))
+                    return
+                }
+                let nameData = data[i..<i+nameLength]
                 i += nameLength
+                
+                guard i < data.count else {
+                    failure(BleTransportError.lowerLevelError(description: "Unexpected end of response data after name"))
+                    return
+                }
                 let versionLength = Int(data[i])
                 i += 1
-                let versionData = data[i..<i+Int(versionLength)]
-                i += versionLength
-                guard let name = String(data: Data(nameData), encoding: .ascii) else { failure(BleTransportError.lowerLevelError(description: "Could not parse response data")); return }
-                guard let version = String(data: Data(versionData), encoding: .ascii) else { failure(BleTransportError.lowerLevelError(description: "Could not parse response data")); return }
+                
+                guard i + versionLength <= data.count else {
+                    failure(BleTransportError.lowerLevelError(description: "Version length \(versionLength) exceeds available data"))
+                    return
+                }
+                let versionData = data[i..<i+versionLength]
+                
+                guard let name = String(data: Data(nameData), encoding: .ascii) else {
+                    failure(BleTransportError.lowerLevelError(description: "Could not parse app name from response"))
+                    return
+                }
+                guard let version = String(data: Data(versionData), encoding: .ascii) else {
+                    failure(BleTransportError.lowerLevelError(description: "Could not parse app version from response"))
+                    return
+                }
                 success(AppInfo(name: name, version: version))
             case .failure(let error):
                 failure(error)
@@ -434,18 +467,34 @@ extension BleTransport: BleModuleDelegate {
                 self.mtuWaitingForCallback = nil
                 return
             }
-            /// This might be a partial response
-            var offset = 6
+
             let hex = apduReceived.data.hexEncodedString()
             
-            if self.currentResponse == "" {
+            // First frame has 10-char header (tag+index+size), subsequent frames have 6-char header (tag+index)
+            var offset = 6
+            
+            if self.currentResponse.isEmpty {
                 offset = 10
+                
+                // Validate hex string is long enough to contain the header
+                guard hex.count >= 10 else {
+                    bleLogger.error("Response frame too short: \(hex.count) hex chars")
+                    self.isExchanging = false
+                    self.exchangeCallback?(.failure(.readError(description: "Response frame too short")))
+                    self.exchangeCallback = nil
+                    return
+                }
                 
                 let a = hex.index(hex.startIndex, offsetBy: 6)
                 let b = hex.index(hex.startIndex, offsetBy: 10)
                 let expectedLength = (Int(hex[a..<b], radix: 16) ?? 1) * 2
                 self.currentResponseRemainingLength = expectedLength
-                print("Expected length is: \(expectedLength)")
+                bleLogger.debug("Expected response length: \(expectedLength, privacy: .private)")
+            }
+            
+            guard hex.count > offset else {
+                bleLogger.error("Frame has no payload data after header")
+                return
             }
             
             let cleanAPDU = hex.suffix(hex.count - offset)
@@ -453,17 +502,13 @@ extension BleTransport: BleModuleDelegate {
             self.currentResponse += cleanAPDU
             self.currentResponseRemainingLength -= cleanAPDU.count
             
-            print("Received: \(cleanAPDU)")
-            
             if self.currentResponseRemainingLength <= 0 {
-                /// We got the full response in `currentResponse`
+                // Full response received
                 self.isExchanging = false
                 self.exchangeCallback?(.success(self.currentResponse))
                 self.exchangeCallback = nil
                 self.currentResponse = ""
                 self.currentResponseRemainingLength = 0
-            } else {
-                print("WAITING_FOR_NEXT_MESSAGE!!")
             }
         } setupFinished: {
             setupFinished?()
@@ -515,8 +560,20 @@ extension BleTransport: BleModuleDelegate {
     
     fileprivate func parseMTUresponse(apduReceived: APDU) {
         if apduReceived.data.first == 0x08 {
-            if let fifthByte = apduReceived.data.advanced(by: 5).first {
-                APDU.mtuSize = Int(fifthByte)
+            // Bounds check: ensure we have at least 6 bytes before accessing index 5
+            guard apduReceived.data.count > 5 else {
+                bleLogger.warning("MTU response too short: \(apduReceived.data.count) bytes")
+                if let connectedPeripheral = connectedPeripheral {
+                    mtuWaitingForCallback?(connectedPeripheral)
+                }
+                return
+            }
+            let mtu = Int(apduReceived.data[5])
+            // Validate MTU is within a reasonable range (20-512 bytes per BLE spec)
+            if mtu >= 20 && mtu <= 512 {
+                APDU.mtuSize = mtu
+            } else {
+                bleLogger.warning("Received MTU \(mtu) outside valid range, keeping default")
             }
         }
         if let connectedPeripheral = connectedPeripheral {
@@ -839,8 +896,16 @@ extension BleTransport {
     }
 }
 
+import os.log
+
+/// Internal logger for BleTransport. Uses Apple's unified logging system
+/// instead of print statements, ensuring APDU data is never leaked in
+/// production builds. Log messages are redacted by default.
+let bleLogger = Logger(subsystem: "com.novashieldwallet.BleTransport", category: "BLE")
+
+/// Replacement for the old global print function. Uses os.Logger so
+/// messages appear in Console.app during development but are redacted
+/// in production and never included in sysdiagnose logs.
 func print(_ object: Any) {
-    #if DEBUG
-    Swift.print("BleTransport", object)
-    #endif
+    bleLogger.debug("\(String(describing: object), privacy: .private)")
 }

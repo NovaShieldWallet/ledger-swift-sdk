@@ -3,134 +3,199 @@
 //  BleTransport
 //
 //  Created by Dante Puglisi on 5/10/22.
+//  Security hardened by NovaShieldWallet 2026.
 //
 
 import Foundation
 
+/// Represents an Application Protocol Data Unit for Ledger device communication.
+///
+/// APDUs are automatically chunked into BLE-compatible frames based on the
+/// negotiated MTU size. Each frame includes a header tag, frame index, and
+/// (for the first frame) the total payload size.
 public class APDU: BluetoothSendable, Receivable {
     
-    public let data: Data                   /// The APDU data to send or receive.
-    public var chunks: [Data] = []          /// The APDU data split into frames smaller than `mtuSize`
+    /// The raw APDU data payload.
+    public let data: Data
     
-    static var mtuSize: Int = 153           /// The maximum number of bytes (including the tag and frame index) we can send. This should be updated every time we connect to a new device.
+    /// The APDU data split into BLE frames smaller than `mtuSize`.
+    public private(set) var chunks: [Data] = []
     
+    /// The maximum number of bytes (including tag and frame index) per BLE frame.
+    /// Updated during MTU negotiation when connecting to a new device.
+    ///
+    /// - Important: Default value of 153 matches Ledger Nano X specifications.
+    nonisolated(unsafe) static var mtuSize: Int = 153
+    
+    /// Whether all chunks have been consumed/sent.
     public var isEmpty: Bool {
         chunks.isEmpty
     }
     
-    public static let inferMTU = APDU(data: [0x08,0x00,0x00,0x00,0x00], preventChunking: true)
+    /// Special APDU used to negotiate MTU size with the connected device.
+    public static let inferMTU = APDU(data: [0x08, 0x00, 0x00, 0x00, 0x00], preventChunking: true)
     
+    /// Creates an APDU from raw byte data.
+    /// - Parameters:
+    ///   - data: The byte array representing the APDU command.
+    ///   - preventChunking: If `true`, the data is sent as a single frame without chunking.
     public init(data: [UInt8], preventChunking: Bool = false) {
         let dataReceived = Data(data)
         self.data = dataReceived
         if preventChunking {
             self.chunks = [Data(data)]
         } else {
-            self.chunks = self.chunkAPDU(data: dataReceived)
+            self.chunks = Self.chunkAPDU(data: dataReceived, mtuSize: Self.mtuSize)
         }
     }
     
-    // Overload to allow passing a String instead of UInt8 since that's what we get from live-common anyway
+    /// Creates an APDU from a hexadecimal string.
+    ///
+    /// - Parameter raw: A hex-encoded string (e.g. `"e0d8000007426974636f696e"`).
+    ///   Must contain only valid hex characters and have even length.
+    ///   Returns an empty APDU if the string is invalid.
     public init(raw: String) {
-        guard raw.isHexDigit else {
+        guard raw.isValidHexString else {
             self.data = Data()
             return
         }
-        let dataReceived = Data(raw.UInt8Array())
+        let bytes = Self.hexToBytes(raw)
+        let dataReceived = Data(bytes)
         self.data = dataReceived
-        self.chunks = self.chunkAPDU(data: dataReceived)
+        self.chunks = Self.chunkAPDU(data: dataReceived, mtuSize: Self.mtuSize)
     }
     
+    /// Creates an APDU from raw Bluetooth data received from a device.
     required public init(bluetoothData: Data) throws {
         self.data = bluetoothData
-        self.chunks = self.chunkAPDU(data: bluetoothData)
+        self.chunks = Self.chunkAPDU(data: bluetoothData, mtuSize: Self.mtuSize)
     }
     
-    // When called by BleTransport it will return the current frame to send
+    /// Returns the current (first) frame for BLE transmission.
     public func toBluetoothData() -> Data {
-        return self.chunks[0]
+        guard let first = chunks.first else {
+            return Data()
+        }
+        return first
     }
     
-    // Increase index to point to the next frame
-    func next() -> Void {
-        self.chunks.removeFirst()
+    /// Advances to the next frame by removing the current one.
+    func next() {
+        guard !chunks.isEmpty else { return }
+        chunks.removeFirst()
     }
     
-    internal func chunkAPDU(data: Data) -> [Data] {
+    /// Splits APDU data into BLE-compatible frames.
+    ///
+    /// Frame format:
+    /// - Byte 0: Tag (0x05 for Ledger devices)
+    /// - Bytes 1-2: Frame index (big-endian UInt16)
+    /// - Bytes 3-4 (first frame only): Total payload size (big-endian UInt16)
+    /// - Remaining bytes: Payload data
+    ///
+    /// - Parameters:
+    ///   - data: The raw APDU data to chunk.
+    ///   - mtuSize: The maximum transmission unit size for framing.
+    /// - Returns: An array of `Data` frames ready for BLE transmission.
+    internal static func chunkAPDU(data: Data, mtuSize: Int) -> [Data] {
+        guard !data.isEmpty else { return [] }
+        
         let apdu: [UInt8] = Array(data)
-        var chunks = Array<Data>()
-        let size = UInt16(apdu.count)
+        var chunks = [Data]()
+        let size = UInt16(clamping: apdu.count)
         
-        let head: [UInt8] = [0x05]     // Tag/Head we need to send for the nano x
-        var hi = 0                     // Our current index inside the data
-        var ind = UInt16(0)            // Frame counter
+        let head: UInt8 = 0x05 // Tag/Head for Ledger devices
+        var offset = 0         // Current position in the payload
+        var frameIndex = UInt16(0)
         
-        while(hi < size) {
-            let maxDataForFrame = ind == 0 ? (APDU.mtuSize - 5) : (APDU.mtuSize - 3)
-            var messageData = Data()
-            messageData.append(Data(head))
-            /// Index is 2 bytes
-            messageData.append(withUnsafeBytes(of: ind.bigEndian, { Data($0) }))
-            if ind == 0 {
-                /// Size is 2 bytes and we only send it in the first frame
-                messageData.append(withUnsafeBytes(of: size.bigEndian, { Data($0) }))
+        while offset < apdu.count {
+            // First frame: 1 (tag) + 2 (index) + 2 (size) = 5 byte overhead
+            // Subsequent frames: 1 (tag) + 2 (index) = 3 byte overhead
+            let overhead = frameIndex == 0 ? 5 : 3
+            let maxPayload = max(mtuSize - overhead, 1)
+            
+            var frame = Data()
+            frame.reserveCapacity(min(mtuSize, apdu.count - offset + overhead))
+            
+            frame.append(head)
+            withUnsafeBytes(of: frameIndex.bigEndian) { frame.append(contentsOf: $0) }
+            
+            if frameIndex == 0 {
+                withUnsafeBytes(of: size.bigEndian) { frame.append(contentsOf: $0) }
             }
-            messageData.append(Data(apdu[hi..<min(hi+maxDataForFrame, apdu.count)]))
             
-            // Move forward in the data
-            hi += maxDataForFrame
-            ind += 1
+            let end = min(offset + maxPayload, apdu.count)
+            frame.append(contentsOf: apdu[offset..<end])
             
-            // Append the newly created frame to the array representing the apdu.
-            chunks.append(messageData)
+            offset = end
+            frameIndex += 1
+            chunks.append(frame)
         }
         return chunks
     }
+    
+    // MARK: - Safe Hex Parsing
+    
+    /// Safely converts a hex string to a byte array.
+    ///
+    /// - Parameter hex: A valid hex string with even length.
+    /// - Returns: The parsed byte array, or empty array if parsing fails.
+    internal static func hexToBytes(_ hex: String) -> [UInt8] {
+        guard hex.count % 2 == 0 else { return [] }
+        
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(hex.count / 2)
+        
+        var index = hex.startIndex
+        while index < hex.endIndex {
+            let nextIndex = hex.index(index, offsetBy: 2)
+            let byteString = hex[index..<nextIndex]
+            guard let byte = UInt8(byteString, radix: 16) else {
+                return [] // Return empty on any parse failure instead of crashing
+            }
+            bytes.append(byte)
+            index = nextIndex
+        }
+        return bytes
+    }
 }
 
-class APDUs: NSObject {
+// MARK: - Common APDU Commands
+
+/// Pre-built APDU commands for common Ledger operations.
+enum APDUCommands {
     public static let openBitcoin: [APDU] = [APDU(raw: "e0d8000007426974636f696e")]
 }
 
+// MARK: - String Extensions
+
 public extension String {
-    func UInt8Array() -> [UInt8] {
-        guard self.count % 2 == 0 else { return [] }
-        var lo = 0
-        let chars = Array(self)
-        var out = Array<UInt8>()
-        while (lo < self.count) {
-            let pair = String(chars[lo])+String(chars[lo+1])
-            out.append(UInt8(pair, radix: 16)!)
-            lo += 2
-        }
-        return out
+    /// Safely converts a hex string to a `[UInt8]` array.
+    ///
+    /// Returns an empty array if the string has odd length or contains non-hex characters.
+    func hexToUInt8Array() -> [UInt8] {
+        return APDU.hexToBytes(self)
     }
     
-    var isHexDigit: Bool {
-        filter(\.isHexDigit).count == count
+    /// Whether this string contains only valid hexadecimal characters and has even length.
+    var isValidHexString: Bool {
+        !isEmpty && count % 2 == 0 && allSatisfy(\.isHexDigit)
     }
 }
 
+// MARK: - Data Extensions
+
 public extension Array where Element == UInt8 {
-    func bytesToHex(spacing: String) -> String {
-        var hexString: String = ""
-        var count = self.count
-        for byte in self
-        {
-            hexString.append(String(format:"%02X", byte))
-            count = count - 1
-            if count > 0
-            {
-                hexString.append(spacing)
-            }
-        }
-        return hexString
+    /// Converts a byte array to a hex string with optional spacing between bytes.
+    func bytesToHex(spacing: String = "") -> String {
+        map { String(format: "%02X", $0) }.joined(separator: spacing)
     }
 }
 
 public extension Data {
+    /// Returns a hex-encoded string representation of this data.
     func hexEncodedString(uppercase: Bool = false) -> String {
         let format = uppercase ? "%02hhX" : "%02hhx"
-        return self.map { String(format: format, $0) }.joined()
+        return map { String(format: format, $0) }.joined()
     }
 }

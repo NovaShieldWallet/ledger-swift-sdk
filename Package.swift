@@ -23,6 +23,10 @@ let package = Package(
         ),
         .testTarget(
             name: "BleTransportTests",
-            dependencies: ["BleTransport"]),
+            dependencies: ["BleTransport"],
+            swiftSettings: [
+                .swiftLanguageMode(.v5)
+            ]
+        ),
     ]
 )
